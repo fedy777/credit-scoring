@@ -1,9 +1,8 @@
 """
 main.py
-Rôle : Serveur FastAPI avec Auth JWT + PostgreSQL + Rôles Admin/Conseiller
+Rôle : Serveur FastAPI avec Auth JWT + PostgreSQL + Rôles Admin/Conseiller + Approbation
 """
-
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
@@ -16,6 +15,8 @@ from backend.auth import (
     hash_password, verify_password,
     create_access_token, get_current_user, require_admin
 )
+import pandas as pd
+import io
 
 # Créer les tables automatiquement
 models.Base.metadata.create_all(bind=engine)
@@ -23,7 +24,7 @@ models.Base.metadata.create_all(bind=engine)
 app = FastAPI(
     title="Credit Scoring API",
     description="API de prédiction de risque crédit avec Auth JWT et rôles",
-    version="3.0.0"
+    version="4.0.0"
 )
 
 app.add_middleware(
@@ -76,32 +77,45 @@ def register(data: RegisterSchema, db: Session = Depends(get_db)):
     if db.query(models.User).filter(models.User.email == data.email).first():
         raise HTTPException(status_code=400, detail="Email déjà utilisé")
 
+    # Admin → approuvé direct | Conseiller → en attente
+    statut = "approuve" if data.role == "admin" else "en_attente"
+
     user = models.User(
         username=data.username,
         email=data.email,
         hashed_password=hash_password(data.password),
-        role=data.role
+        role=data.role,
+        statut=statut
     )
     db.add(user)
     db.commit()
     db.refresh(user)
     return {
-        "message": "Compte créé avec succès",
+        "message": "Compte créé avec succès" if statut == "approuve"
+                   else "Demande envoyée — en attente d'approbation par l'administrateur",
         "username": user.username,
-        "role": user.role
+        "role": user.role,
+        "statut": user.statut
     }
 
 
 @app.post("/auth/login", tags=["Auth"])
-def login(
-    form: OAuth2PasswordRequestForm = Depends(),
-    db: Session = Depends(get_db)
-):
-    user = db.query(models.User).filter(
-        models.User.username == form.username
-    ).first()
+def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.username == form.username).first()
     if not user or not verify_password(form.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Identifiants incorrects")
+
+    # Vérifier le statut du compte
+    if user.statut == "en_attente":
+        raise HTTPException(
+            status_code=403,
+            detail="⏳ Votre compte est en attente d'approbation par l'administrateur."
+        )
+    if user.statut == "refuse":
+        raise HTTPException(
+            status_code=403,
+            detail="❌ Votre demande d'accès a été refusée par l'administrateur."
+        )
 
     token = create_access_token({"sub": user.username, "role": user.role})
     return {
@@ -118,17 +132,18 @@ def get_me(current_user=Depends(get_current_user)):
         "id": current_user.id,
         "username": current_user.username,
         "email": current_user.email,
-        "role": current_user.role
+        "role": current_user.role,
+        "statut": current_user.statut
     }
 
 
 # ── Santé ─────────────────────────────────────────────────────────────────
 @app.get("/", tags=["Santé"])
 def root():
-    return {"message": "Credit Scoring API v3 opérationnelle ✅"}
+    return {"message": "Credit Scoring API v4 opérationnelle ✅"}
 
 
-# ── Prédiction (Conseiller seulement) ─────────────────────────────────────
+# ── Prédiction ────────────────────────────────────────────────────────────
 @app.post("/predict", tags=["Prédiction"])
 def predict(
     client: ClientData,
@@ -138,7 +153,6 @@ def predict(
     try:
         data = client.to_feature_dict()
         result = predict_credit(data)
-
         db_request = models.CreditRequest(
             user_id=current_user.id,
             revolving_utilization=client.RevolvingUtilizationOfUnsecuredLines,
@@ -164,7 +178,7 @@ def predict(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── Explication (Conseiller seulement) ────────────────────────────────────
+# ── Explication ───────────────────────────────────────────────────────────
 @app.post("/explain", tags=["Explication"])
 def explain(
     client: ClientData,
@@ -175,7 +189,6 @@ def explain(
         data = client.to_feature_dict()
         result = predict_credit(data)
         explanation = explain_prediction(data)
-
         db_request = models.CreditRequest(
             user_id=current_user.id,
             revolving_utilization=client.RevolvingUtilizationOfUnsecuredLines,
@@ -203,15 +216,10 @@ def explain(
 
 # ── Historique ────────────────────────────────────────────────────────────
 @app.get("/history", tags=["Historique"])
-def get_history(
-    db: Session = Depends(get_db),
-    current_user=Depends(get_current_user)
-):
-    # Admin voit tout, Conseiller voit seulement ses demandes
+def get_history(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
     if current_user.role == "admin":
         requests = db.query(models.CreditRequest).order_by(
-            models.CreditRequest.created_at.desc()
-        ).all()
+            models.CreditRequest.created_at.desc()).all()
     else:
         requests = db.query(models.CreditRequest).filter(
             models.CreditRequest.user_id == current_user.id
@@ -219,24 +227,35 @@ def get_history(
     return requests
 
 
-# ── Statistiques ──────────────────────────────────────────────────────────
-@app.get("/stats", tags=["Statistiques"])
-def get_stats(
+# ── Supprimer une demande ─────────────────────────────────────────────────
+@app.delete("/history/{request_id}", tags=["Historique"])
+def delete_request(
+    request_id: int,
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user)
 ):
-    # Admin voit stats globales, Conseiller voit ses stats
+    request = db.query(models.CreditRequest).filter(
+        models.CreditRequest.id == request_id).first()
+    if not request:
+        raise HTTPException(status_code=404, detail="Demande non trouvée")
+    if current_user.role != "admin" and request.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Vous ne pouvez pas supprimer cette demande")
+    db.delete(request)
+    db.commit()
+    return {"message": f"Demande #{request_id} supprimée avec succès"}
+
+
+# ── Statistiques ──────────────────────────────────────────────────────────
+@app.get("/stats", tags=["Statistiques"])
+def get_stats(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
     if current_user.role == "admin":
         query = db.query(models.CreditRequest)
     else:
         query = db.query(models.CreditRequest).filter(
-            models.CreditRequest.user_id == current_user.id
-        )
-
-    total = query.count()
+            models.CreditRequest.user_id == current_user.id)
+    total    = query.count()
     accepted = query.filter(models.CreditRequest.decision == "ACCEPTÉ").count()
-    refused = query.filter(models.CreditRequest.decision == "REFUSÉ").count()
-
+    refused  = query.filter(models.CreditRequest.decision == "REFUSÉ").count()
     return {
         "total": total,
         "accepted": accepted,
@@ -248,20 +267,64 @@ def get_stats(
 
 # ── Admin : Liste des utilisateurs ────────────────────────────────────────
 @app.get("/admin/users", tags=["Admin"])
-def get_users(
-    db: Session = Depends(get_db),
-    current_user=Depends(require_admin)
-):
+def get_users(db: Session = Depends(get_db), current_user=Depends(require_admin)):
     users = db.query(models.User).all()
     return [
         {
-            "id": u.id,
-            "username": u.username,
-            "email": u.email,
-            "role": u.role
+            "id": u.id, "username": u.username,
+            "email": u.email, "role": u.role,
+            "statut": u.statut
         }
         for u in users
     ]
+
+
+# ── Admin : Demandes en attente ───────────────────────────────────────────
+@app.get("/admin/pending", tags=["Admin"])
+def get_pending(db: Session = Depends(get_db), current_user=Depends(require_admin)):
+    users = db.query(models.User).filter(
+        models.User.statut == "en_attente"
+    ).all()
+    return [
+        {
+            "id": u.id, "username": u.username,
+            "email": u.email, "role": u.role,
+            "statut": u.statut, "created_at": u.created_at
+        }
+        for u in users
+    ]
+
+
+# ── Admin : Approuver un utilisateur ─────────────────────────────────────
+@app.put("/admin/users/{user_id}/approuver", tags=["Admin"])
+def approuver_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_admin)
+):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
+    user.statut = "approuve"
+    db.commit()
+    return {"message": f"✅ Compte de {user.username} approuvé avec succès"}
+
+
+# ── Admin : Refuser un utilisateur ───────────────────────────────────────
+@app.put("/admin/users/{user_id}/refuser", tags=["Admin"])
+def refuser_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_admin)
+):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
+    if user.id == current_user.id:
+        raise HTTPException(status_code=400, detail="Impossible de refuser votre propre compte")
+    user.statut = "refuse"
+    db.commit()
+    return {"message": f"❌ Compte de {user.username} refusé"}
 
 
 # ── Admin : Supprimer un utilisateur ─────────────────────────────────────
@@ -275,10 +338,7 @@ def delete_user(
     if not user:
         raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
     if user.id == current_user.id:
-        raise HTTPException(
-            status_code=400,
-            detail="Impossible de supprimer votre propre compte"
-        )
+        raise HTTPException(status_code=400, detail="Impossible de supprimer votre propre compte")
     db.delete(user)
     db.commit()
     return {"message": f"Utilisateur {user.username} supprimé avec succès"}
@@ -286,32 +346,20 @@ def delete_user(
 
 # ── Admin : Stats par conseiller ──────────────────────────────────────────
 @app.get("/admin/stats-by-user", tags=["Admin"])
-def stats_by_user(
-    db: Session = Depends(get_db),
-    current_user=Depends(require_admin)
-):
-    users = db.query(models.User).filter(
-        models.User.role == "conseiller"
-    ).all()
-
+def stats_by_user(db: Session = Depends(get_db), current_user=Depends(require_admin)):
+    users = db.query(models.User).filter(models.User.role == "conseiller").all()
     result = []
     for user in users:
-        total = db.query(models.CreditRequest).filter(
-            models.CreditRequest.user_id == user.id
-        ).count()
+        total    = db.query(models.CreditRequest).filter(models.CreditRequest.user_id == user.id).count()
         accepted = db.query(models.CreditRequest).filter(
             models.CreditRequest.user_id == user.id,
-            models.CreditRequest.decision == "ACCEPTÉ"
-        ).count()
-        refused = db.query(models.CreditRequest).filter(
+            models.CreditRequest.decision == "ACCEPTÉ").count()
+        refused  = db.query(models.CreditRequest).filter(
             models.CreditRequest.user_id == user.id,
-            models.CreditRequest.decision == "REFUSÉ"
-        ).count()
+            models.CreditRequest.decision == "REFUSÉ").count()
         result.append({
             "conseiller": user.username,
-            "total": total,
-            "accepted": accepted,
-            "refused": refused,
+            "total": total, "accepted": accepted, "refused": refused,
             "acceptance_rate": round(accepted / total * 100, 1) if total > 0 else 0
         })
     return result
@@ -319,24 +367,16 @@ def stats_by_user(
 
 # ── Admin : Historique complet avec nom du conseiller ─────────────────────
 @app.get("/admin/history-all", tags=["Admin"])
-def history_all(
-    db: Session = Depends(get_db),
-    current_user=Depends(require_admin)
-):
+def history_all(db: Session = Depends(get_db), current_user=Depends(require_admin)):
     requests = db.query(models.CreditRequest).order_by(
-        models.CreditRequest.created_at.desc()
-    ).all()
-
+        models.CreditRequest.created_at.desc()).all()
     result = []
     for req in requests:
-        user = db.query(models.User).filter(
-            models.User.id == req.user_id
-        ).first()
+        user = db.query(models.User).filter(models.User.id == req.user_id).first()
         result.append({
             "id": req.id,
             "conseiller": user.username if user else "Inconnu",
-            "age": req.age,
-            "monthly_income": req.monthly_income,
+            "age": req.age, "monthly_income": req.monthly_income,
             "decision": req.decision,
             "probability_default": req.probability_default,
             "probability_accepted": req.probability_accepted,
@@ -344,7 +384,150 @@ def history_all(
             "created_at": req.created_at,
             "debt_ratio": req.debt_ratio,
             "open_credit_lines": req.open_credit_lines,
-            "late_90": req.late_90,
-            "dependents": req.dependents
+            "late_90": req.late_90, "dependents": req.dependents
         })
     return result
+
+
+# ── Import CSV ────────────────────────────────────────────────────────────
+@app.get("/import/template", tags=["Import CSV"])
+def download_template():
+    from fastapi.responses import StreamingResponse
+    template_data = {
+        "RevolvingUtilizationOfUnsecuredLines": [0.5, 0.85, 0.1],
+        "age": [35, 28, 52],
+        "NumberOfTime30-59DaysPastDueNotWorse": [0, 2, 0],
+        "DebtRatio": [0.3, 0.6, 0.2],
+        "MonthlyIncome": [5000, 2500, 8000],
+        "NumberOfOpenCreditLinesAndLoans": [4, 7, 2],
+        "NumberOfTimes90DaysLate": [0, 1, 0],
+        "NumberRealEstateLoansOrLines": [1, 0, 2],
+        "NumberOfTime60-89DaysPastDueNotWorse": [0, 1, 0],
+        "NumberOfDependents": [2, 0, 3]
+    }
+    df = pd.DataFrame(template_data)
+    output = io.StringIO()
+    df.to_csv(output, index=False)
+    output.seek(0)
+    return StreamingResponse(
+        io.BytesIO(output.getvalue().encode()),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=modele_clients.csv"}
+    )
+
+
+@app.post("/import/csv", tags=["Import CSV"])
+async def import_csv(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user)
+):
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="Le fichier doit être un CSV")
+
+    try:
+        contents = await file.read()
+        df = pd.read_csv(io.BytesIO(contents))
+
+        required_columns = [
+            "RevolvingUtilizationOfUnsecuredLines", "age",
+            "NumberOfTime30-59DaysPastDueNotWorse", "DebtRatio",
+            "MonthlyIncome", "NumberOfOpenCreditLinesAndLoans",
+            "NumberOfTimes90DaysLate", "NumberRealEstateLoansOrLines",
+            "NumberOfTime60-89DaysPastDueNotWorse", "NumberOfDependents"
+        ]
+
+        missing = [col for col in required_columns if col not in df.columns]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Colonnes manquantes : {', '.join(missing)}")
+
+        if len(df) > 500:
+            raise HTTPException(status_code=400, detail="Maximum 500 clients par import")
+
+        results = []
+        accepted_count = 0
+        refused_count  = 0
+
+        for index, row in df.iterrows():
+            try:
+                data = {col: float(row[col]) for col in required_columns}
+                data["age"] = int(row["age"])
+                data["NumberOfOpenCreditLinesAndLoans"] = int(row["NumberOfOpenCreditLinesAndLoans"])
+                data["NumberOfTimes90DaysLate"]         = int(row["NumberOfTimes90DaysLate"])
+                data["NumberRealEstateLoansOrLines"]    = int(row["NumberRealEstateLoansOrLines"])
+                data["TotalLatePayments"] = (
+                    data["NumberOfTime30-59DaysPastDueNotWorse"] +
+                    data["NumberOfTime60-89DaysPastDueNotWorse"] +
+                    data["NumberOfTimes90DaysLate"]
+                )
+                data["DebtToIncome"] = data["DebtRatio"] / (data["MonthlyIncome"] + 1)
+
+                result = predict_credit(data)
+
+                # LIME pour chaque client
+                try:
+                    from backend.explain import explain_prediction
+                    explanation      = explain_prediction(data)
+                    explanation_text = explanation["resume_fr"]
+                except Exception:
+                    explanation_text = ""
+
+                db_request = models.CreditRequest(
+                    user_id=int(current_user.id),
+                    revolving_utilization=float(row["RevolvingUtilizationOfUnsecuredLines"]),
+                    age=int(row["age"]),
+                    late_30_59=float(row["NumberOfTime30-59DaysPastDueNotWorse"]),
+                    debt_ratio=float(row["DebtRatio"]),
+                    monthly_income=float(row["MonthlyIncome"]),
+                    open_credit_lines=int(row["NumberOfOpenCreditLinesAndLoans"]),
+                    late_90=int(row["NumberOfTimes90DaysLate"]),
+                    real_estate_loans=int(row["NumberRealEstateLoansOrLines"]),
+                    late_60_89=float(row["NumberOfTime60-89DaysPastDueNotWorse"]),
+                    dependents=float(row["NumberOfDependents"]),
+                    decision=str(result["decision"]),
+                    probability_default=float(result["probability_default"]),
+                    probability_accepted=float(result["probability_accepted"]),
+                    explanation_summary=explanation_text
+                )
+                db.add(db_request)
+
+                if result["decision"] == "ACCEPTÉ":
+                    accepted_count += 1
+                else:
+                    refused_count += 1
+
+                results.append({
+                    "ligne": int(index + 1),
+                    "age": int(row["age"]),
+                    "monthly_income": float(row["MonthlyIncome"]),
+                    "decision": str(result["decision"]),
+                    "probability_default": float(result["probability_default"]),
+                    "probability_accepted": float(result["probability_accepted"]),
+                    "statut": "✅ succès"
+                })
+
+            except Exception as e:
+                results.append({
+                    "ligne": int(index + 1),
+                    "age": int(row.get("age", 0)),
+                    "monthly_income": float(row.get("MonthlyIncome", 0)),
+                    "decision": "ERREUR",
+                    "probability_default": 0.0,
+                    "probability_accepted": 0.0,
+                    "statut": f"❌ erreur: {str(e)}"
+                })
+
+        db.commit()
+
+        return {
+            "total": int(len(df)),
+            "accepted": int(accepted_count),
+            "refused": int(refused_count),
+            "acceptance_rate": round(float(accepted_count) / len(df) * 100, 1),
+            "results": results
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
